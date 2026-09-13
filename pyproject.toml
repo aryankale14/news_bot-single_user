@@ -1,2 +1,12 @@
+[project]
+name = "news-bot-single-user"
+version = "0.1.0"
+description = "Single User News Pulse Bot for Vercel"
+dependencies = [
+    "google-genai",
+    "requests",
+    "pytz"
+]
+
 [tool.vercel]
 entrypoint = "api.cron:handler"
