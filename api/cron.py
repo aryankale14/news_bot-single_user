@@ -7,6 +7,7 @@ import requests
 import concurrent.futures
 from http.server import BaseHTTPRequestHandler
 from google import genai
+from google.genai import types
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +40,7 @@ def fetch_category_news(client, category_id, time_context, current_date_str):
     CRITICAL INSTRUCTION FOR LINKS: Do NOT use Markdown link formatting like [URL](URL). You must just output the raw, plain text URL directly after "URL: ".
     Include the source name. 3 sentences max per headline.
     """
+    # 1. Primary Attempt: gemini-3.5-flash-lite via interactions API
     try:
         interaction = client.interactions.create(
             model="gemini-3.5-flash-lite",
@@ -46,11 +48,30 @@ def fetch_category_news(client, category_id, time_context, current_date_str):
             tools=[{"type": "google_search"}]
         )
         raw_text = getattr(interaction, "output_text", str(interaction)) or ""
-        clean_text = raw_text.replace("**", "").replace("*", "")
-        return category_id, f"📌 {category_name.upper()}\n{clean_text}"
+        clean_text = raw_text.replace("**", "").replace("*", "").strip()
+        if len(clean_text) > 20:
+            return category_id, f"📌 {category_name.upper()}\n{clean_text}"
     except Exception as e:
-        logger.error(f"Error fetching category {category_id} ({category_name}): {e}")
-        return category_id, f"📌 {category_name.upper()}\nCould not fetch news at this time."
+        logger.warning(f"gemini-3.5-flash-lite failed for category {category_id} ({category_name}): {e}")
+
+    # 2. Fallback Attempt: gemini-2.5-flash via generate_content API
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            )
+        )
+        raw_text = response.text or ""
+        clean_text = raw_text.replace("**", "").replace("*", "").strip()
+        if len(clean_text) > 20:
+            return category_id, f"📌 {category_name.upper()}\n{clean_text}"
+    except Exception as e:
+        logger.error(f"gemini-2.5-flash fallback failed for category {category_id} ({category_name}): {e}")
+
+    # Return None on failure to avoid sending empty error placeholders
+    return category_id, None
 
 def send_telegram_message(bot_token, chat_id, text):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -79,7 +100,7 @@ def run_briefing():
 
     logger.info(f"Starting news fetch for date: {current_date_str} ({time_context})")
 
-    # Fetch categories concurrently using ThreadPoolExecutor for fast execution
+    # Fetch categories concurrently using ThreadPoolExecutor
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_cat = {
@@ -88,11 +109,12 @@ def run_briefing():
         }
         for future in concurrent.futures.as_completed(future_to_cat):
             cat_id, text = future.result()
-            results[cat_id] = text
+            if text:
+                results[cat_id] = text
 
     parts = [results[cat_id] for cat_id in sorted(CATEGORIES.keys()) if cat_id in results]
     if not parts:
-        logger.error("No category results fetched.")
+        logger.error("No valid category news could be fetched from Gemini API.")
         return False
 
     header = f"⚡ NEWS PULSE ({'MORNING' if current_hour < 12 else 'EVENING'} BRIEFING)\n🗓️ {current_date_str}\n"
@@ -119,7 +141,6 @@ def run_briefing():
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # Verify optional Cron Secret header if set
         cron_secret = os.getenv("CRON_SECRET")
         if cron_secret:
             auth_header = self.headers.get("Authorization")
@@ -135,7 +156,7 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            msg = "Briefing sent successfully" if success else "Briefing empty or failed"
+            msg = "Briefing sent successfully" if success else "Briefing empty or failed (no news fetched)"
             self.wfile.write(json.dumps({"status": "ok", "message": msg}).encode('utf-8'))
         except Exception as e:
             logger.error(f"Handler error: {e}")
@@ -148,6 +169,5 @@ class handler(BaseHTTPRequestHandler):
         self.do_GET()
 
 if __name__ == "__main__":
-    # Local CLI test execution
     print("Testing briefing locally...")
     run_briefing()
